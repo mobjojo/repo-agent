@@ -1,0 +1,20 @@
+diff --git a/tests/test_itsdangerous/test_timed.py b/tests/test_itsdangerous/test_timed.py
+index 5504300..a4c1741 100644
+--- a/tests/test_itsdangerous/test_timed.py
++++ b/tests/test_itsdangerous/test_timed.py
+@@ -66,6 +66,15 @@ class TestTimestampSigner(FreezeMixin, TestSigner):
+         assert "Malformed" in str(exc_info.value)
+         assert exc_info.value.date_signed is None
+ 
++    def test_malformed_future_timestamp(self, signer):
++        signed = b"value.TgPVoaGhoQ.AGBfQ6G6cr07byTRt0zAdPljHOY"
++
++        with pytest.raises(BadTimeSignature) as exc_info:
++            signer.unsign(signed)
++
++        assert "Malformed" in str(exc_info.value)
++        assert exc_info.value.date_signed is None
++
+     def test_future_age(self, signer):
+         signed = signer.sign("value")
+ 

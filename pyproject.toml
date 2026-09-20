@@ -1,0 +1,23 @@
+[project]
+name = "repo-agent"
+version = "0.1.0"
+description = "Repository-level coding agent: the M1 walking skeleton"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0",
+    "langchain-core>=1.0",
+    "litellm>=1.60",
+]
+
+[project.scripts]
+repo-agent = "repo_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["repo_agent", "harness", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

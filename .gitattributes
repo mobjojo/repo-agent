@@ -1,0 +1,12 @@
+# The whole project is LF on disk and the harness depends on it: `git apply` refuses CRLF
+# patches, and a checkout that silently rewrites line endings would make every diff differ
+# from the artifact it was produced from. Failures here are quiet, so declare it once.
+* text=auto eol=lf
+
+# Task fixtures are byte-exact artifacts: a patch must apply to the same bytes that were
+# captured, so never let git normalise them.
+*.patch -text
+tasks/fixtures/** -text
+
+*.docx binary
+*.png binary

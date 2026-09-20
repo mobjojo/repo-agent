@@ -1,0 +1,27 @@
+diff --git a/src/click/types.py b/src/click/types.py
+index 699bb31..556f20f 100644
+--- a/src/click/types.py
++++ b/src/click/types.py
+@@ -195,13 +195,16 @@ class FuncParamType(ParamType[ParamTypeValue]):
+     ) -> ParamTypeValue:
+         try:
+             return self.func(value)
+-        except ValueError:
+-            try:
+-                value = str(value)
+-            except UnicodeError:
+-                value = value.decode("utf-8", "replace")
++        except ValueError as exc:
++            message = str(exc)
++
++            if not message:
++                try:
++                    message = str(value)
++                except UnicodeError:
++                    message = value.decode("utf-8", "replace")
+ 
+-            self.fail(value, param, ctx)
++            self.fail(message, param, ctx)
+ 
+ 
+ class UnprocessedParamType(ParamType[t.Any]):

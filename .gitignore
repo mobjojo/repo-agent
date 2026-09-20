@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+eval-runs/
+work/
+# Local fixture checkouts, rebuilt from tasks/fixtures/*/README.md
+.repos/
+# Word/WPS lock files
+~$*.docx

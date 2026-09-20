@@ -1,0 +1,49 @@
+diff --git a/src/werkzeug/_internal.py b/src/werkzeug/_internal.py
+index 1f02d15a..ee0ac7b8 100644
+--- a/src/werkzeug/_internal.py
++++ b/src/werkzeug/_internal.py
+@@ -193,20 +193,23 @@ class _DictAccessorProperty(t.Generic[_TAccessorValue]):
+         return f"<{type(self).__name__} {self.name}>"
+ 
+ 
+-_plain_int_re = re.compile(r"-?[a-z0-9]+", re.ASCII | re.IGNORECASE)
++_plain_int_re = {
++    10: re.compile(r"-?[0-9]+", re.ASCII),
++    16: re.compile(r"-?[0-9a-f]+", re.ASCII | re.IGNORECASE),
++}
+ 
+ 
+-def _plain_int(value: str, base: int = 10) -> int:
+-    """Parse an int only if it is ASCII digits and ``-``.
++def _plain_int(value: str, base: t.Literal[10, 16] = 10) -> int:
++    """Parse an int only if it valid ASCII characters for the base.
+ 
+-    This disallows ``+``, ``_``, and non-ASCII digits, which are accepted by
+-    ``int`` but are not allowed in HTTP header values.
++    This disallows ``+``, ``_``, ``0x``, and non-ASCII digits, which are
++    accepted by ``int`` but are not allowed in HTTP header values.
+ 
+-    Any surrounding whitespace is stripped.
++    Any surrounding spaces and tabs are stripped.
+     """
+-    value = value.strip()
++    value = value.strip(" \t")
+ 
+-    if _plain_int_re.fullmatch(value) is None:
++    if _plain_int_re[base].fullmatch(value) is None:
+         raise ValueError
+ 
+     return int(value, base)
+diff --git a/src/werkzeug/serving.py b/src/werkzeug/serving.py
+index f7dcc5ea..0fa3f088 100644
+--- a/src/werkzeug/serving.py
++++ b/src/werkzeug/serving.py
+@@ -108,7 +108,7 @@ class DechunkedInput(io.RawIOBase):
+ 
+     def read_chunk_len(self) -> int:
+         try:
+-            line = self._rfile.readline().decode("latin1")
++            line = self._rfile.readline().decode("latin1").removesuffix("\r\n")
+             _len = _plain_int(line, 16)
+         except ValueError as e:
+             raise OSError("Invalid chunk header") from e

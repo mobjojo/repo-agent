@@ -1,0 +1,22 @@
+diff --git a/tests/test_urls.py b/tests/test_urls.py
+index 101b886e..462f1a7f 100644
+--- a/tests/test_urls.py
++++ b/tests/test_urls.py
+@@ -104,3 +104,17 @@ def test_iri_to_uri_dont_quote_valid_code_points():
+ def test_itms_services() -> None:
+     url = "itms-services://?action=download-manifest&url=https://test.example/path"
+     assert urls.iri_to_uri(url) == url
++
++
++@pytest.mark.parametrize(
++    "value",
++    ["http://:p@d.test", "http://u:@d.test", "http://:@d.test", "http://u@d.test"],
++)
++def test_uri_empty_auth(value: str) -> None:
++    assert urls.uri_to_iri(value) == value
++    assert urls.iri_to_uri(value) == value
++
++
++def test_uri_port_0() -> None:
++    assert urls.uri_to_iri("http://d.test:0") == "http://d.test:0"
++    assert urls.iri_to_uri("http://d.test:0") == "http://d.test:0"

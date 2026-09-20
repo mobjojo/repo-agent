@@ -1,0 +1,31 @@
+diff --git a/tests/test_routing.py b/tests/test_routing.py
+index 7ce6a9a5..2fd89179 100644
+--- a/tests/test_routing.py
++++ b/tests/test_routing.py
+@@ -1,4 +1,5 @@
+ import gc
++import sys
+ import typing as t
+ import uuid
+ 
+@@ -751,6 +752,20 @@ def test_default_converters():
+     assert "foo" not in r.Map.default_converters
+ 
+ 
++@pytest.mark.parametrize(
++    "value",
++    [
++        pytest.param("1" * (sys.get_int_max_str_digits() + 1), id="int_max_str_digits"),
++    ],
++)
++def test_int_converter_404(value: str) -> None:
++    m = r.Map([r.Rule("/<int:a>", endpoint="a")])
++    a = m.bind("a.test")
++
++    with pytest.raises(NotFound):
++        a.match(f"/{value}")
++
++
+ def test_uuid_converter():
+     m = r.Map([r.Rule("/a/<uuid:a_uuid>", endpoint="a")])
+     a = m.bind("example.org", "/")

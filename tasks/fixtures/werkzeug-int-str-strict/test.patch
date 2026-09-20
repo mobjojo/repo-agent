@@ -1,0 +1,15 @@
+diff --git a/tests/test_internal.py b/tests/test_internal.py
+index d4c1246a..188aee9b 100644
+--- a/tests/test_internal.py
++++ b/tests/test_internal.py
+@@ -45,6 +45,10 @@ def test_wrapper_internals():
+         ("7B", 16, 123),
+         ("-7B", 16, -123),
+         ("7b", 16, 123),
++        ("0x7B", 16, None),
++        (" 123", 10, 123),
++        ("\t123", 10, 123),
++        ("\N{PARAGRAPH SEPARATOR}123", 10, None),
+     ],
+ )
+ def test_plain_int(value: str, base: int, expect: int | None) -> None:
