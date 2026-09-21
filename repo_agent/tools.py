@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import RunConfig
-from .guard import Guard, GuardError
+from .guard import Guard, GuardError, whole_suite_reason
 from .sandbox import Sandbox
 
 MAX_VIEW_LINES = 400
@@ -268,6 +268,11 @@ class WorkspaceTools:
         command = str(args.get("command", "")).strip()
         if not command:
             return ToolOutcome("error: empty command", ok=False)
+        refusal = whole_suite_reason(
+            command, self.cfg.workspace, self.cfg.bash_timeout_s, self.cfg.test_command
+        )
+        if refusal:
+            return ToolOutcome(refusal, ok=False)
         result = self.sandbox.run(command, timeout=self.cfg.bash_timeout_s)
         return ToolOutcome(result.render(), ok=result.exit_code == 0)
 

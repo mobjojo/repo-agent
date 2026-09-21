@@ -33,12 +33,14 @@ rehearses both without spending a token, which is why it is safe to run before e
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -386,6 +388,69 @@ def report(outcomes: list[TaskOutcome], out_dir: Path) -> dict:
     return summary
 
 
+def guarded_run_one(
+    task: Task,
+    work_root: Path,
+    model: str | None,
+    sandbox: str | None,
+    check_only: bool,
+) -> TaskOutcome:
+    """Run one task, turning an infrastructure failure into a scoreable outcome.
+
+    A clone that dies must not discard the other nineteen results, and it must not look like
+    the model failed: it gets its own stage, ``harness_error``, so pass@1 stays honest and the
+    error stays visible (the exit code is already non-zero whenever anything did not pass).
+    """
+    try:
+        return run_one(task, work_root, model, sandbox, pre_check_only=check_only)
+    except Exception as exc:  # noqa: BLE001 - the point is to survive anything
+        return TaskOutcome(
+            task.id,
+            False,
+            "harness_error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def run_parallel(
+    tasks: list[Task],
+    work_root: Path,
+    model: str | None,
+    sandbox: str | None,
+    check_only: bool,
+    out_dir: Path,
+    jobs: int,
+) -> list[TaskOutcome]:
+    """Run the batch on ``jobs`` threads and return outcomes in task-file order.
+
+    Each task owns its own checkout, run directory and artifacts, so the only shared state is
+    the console and the artifacts copy; both are serialised. Results are re-ordered at the end
+    because the log and the baseline table are read as an ordered list, and a batch that
+    finishes out of order must not shuffle them.
+    """
+    lock = threading.Lock()
+    finished: dict[str, TaskOutcome] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        pending = {
+            pool.submit(guarded_run_one, task, work_root, model, sandbox, check_only): task
+            for task in tasks
+        }
+        with lock:
+            print("-> " + ", ".join(task.id for task in tasks))
+        for future in concurrent.futures.as_completed(pending):
+            outcome = future.result()
+            finished[outcome.id] = outcome
+            if not check_only:
+                keep_artifacts(outcome, out_dir)
+            with lock:
+                flag = "PASS" if outcome.fixed else "fail"
+                print(
+                    f"   done {outcome.id:<24} {flag}  {outcome.stage:<14} "
+                    f"steps={outcome.steps:<3} {outcome.duration_s}s"
+                )
+    return [finished[task.id] for task in tasks]
+
+
 def run_eval(
     tasks_path: Path,
     out_dir: Path | None = None,
@@ -393,21 +458,40 @@ def run_eval(
     sandbox: str | None = None,
     limit: int | None = None,
     check_only: bool = False,
+    only: list[str] | None = None,
+    jobs: int = 1,
 ) -> int:
     tasks = load_tasks(tasks_path)
+    known = {task.id for task in tasks}
+    if only:
+        wanted = {name.strip() for name in only if name.strip()}
+        missing = sorted(wanted - known)
+        if missing:
+            print(f"unknown task id(s): {', '.join(missing)}", file=sys.stderr)
+            print(f"known: {', '.join(sorted(known))}", file=sys.stderr)
+            return 2
+        tasks = [task for task in tasks if task.id in wanted]
     if limit:
         tasks = tasks[:limit]
     out_dir = out_dir or Path("eval-runs") / time.strftime("%Y%m%d-%H%M%S")
     work_root = Path(tempfile.mkdtemp(prefix="repo-agent-eval-"))
-    print(f"tasks: {len(tasks)}   work root: {work_root}")
+    print(f"tasks: {len(tasks)}/{len(known)}   jobs: {jobs}   work root: {work_root}")
+    if jobs > 1:
+        print(
+            "note: latency and wall-clock numbers are only comparable between runs with the "
+            "same --jobs; pass@1 and cost are not affected."
+        )
     outcomes: list[TaskOutcome] = []
     try:
-        for task in tasks:
-            print(f"-> {task.id}")
-            outcome = run_one(task, work_root, model, sandbox, pre_check_only=check_only)
-            outcomes.append(outcome)
-            if not check_only:
-                keep_artifacts(outcome, out_dir)
+        if jobs <= 1:
+            for task in tasks:
+                print(f"-> {task.id}")
+                outcome = guarded_run_one(task, work_root, model, sandbox, check_only)
+                outcomes.append(outcome)
+                if not check_only:
+                    keep_artifacts(outcome, out_dir)
+        else:
+            outcomes = run_parallel(tasks, work_root, model, sandbox, check_only, out_dir, jobs)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
     if check_only:
@@ -431,6 +515,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sandbox", default=None, choices=["local", "docker"])
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="run this many tasks at once (default 1 = serial). Wall-clock and latency "
+        "numbers are only comparable between runs that used the same --jobs; pass@1 and cost "
+        "are not affected. Serial stays the default because a baseline should be reproducible",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=None,
+        metavar="TASK_ID",
+        help="run just these task ids (repeatable). Cheaper than guessing: after changing the "
+        "loop detector or a budget, prove the change is actually exercised before paying for "
+        "the whole set",
+    )
+    parser.add_argument(
         "--check-only",
         action="store_true",
         help="only verify that each task is broken before the fix; never calls a model",
@@ -448,6 +549,8 @@ def main(argv: list[str] | None = None) -> int:
         args.sandbox,
         args.limit,
         args.check_only,
+        args.only,
+        args.jobs,
     )
 
 

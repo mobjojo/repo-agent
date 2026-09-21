@@ -76,6 +76,72 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(record["fixed"])
         self.assertEqual(record["touched_files"], ["calc/ops.py"])
 
+    def _write_task_set(self, name: str, ids: list[str]) -> Path:
+        path = self.tmp / name
+        body = [
+            json.dumps(
+                {
+                    "id": task_id,
+                    "repo": str(self.repo),
+                    "issue": "add(2, 3) returns -1; it should return 5.",
+                    "test_command": "python -m unittest discover -s tests -t . -v",
+                    "fail_to_pass": FAIL_TO_PASS,
+                    "pass_to_pass": PASS_TO_PASS,
+                    "max_steps": 12,
+                }
+            )
+            for task_id in ids
+        ]
+        path.write_text("\n".join(body) + "\n", encoding="utf-8")
+        return path
+
+    def test_parallel_jobs_match_serial_and_keep_task_order(self) -> None:
+        # Concurrency is a wall-clock optimisation, so it must not change a single verdict -
+        # and it must not reorder the results file, which the baseline table is read from.
+        tasks = self._write_task_set("many.jsonl", ["toy-001", "toy-002", "toy-003"])
+        with mock.patch.object(harness, "run_agent", scripted_run_agent):
+            serial = harness.run_eval(tasks, out_dir=self.tmp / "out-serial", jobs=1)
+            parallel = harness.run_eval(tasks, out_dir=self.tmp / "out-parallel", jobs=3)
+
+        def rows(name: str) -> list[dict]:
+            text = (self.tmp / name / "results.jsonl").read_text(encoding="utf-8")
+            return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+        self.assertEqual(serial, parallel)
+        self.assertEqual(serial, 0)
+        self.assertEqual(
+            [row["id"] for row in rows("out-parallel")], ["toy-001", "toy-002", "toy-003"]
+        )
+        self.assertEqual(
+            [(row["id"], row["fixed"], row["stage"]) for row in rows("out-serial")],
+            [(row["id"], row["fixed"], row["stage"]) for row in rows("out-parallel")],
+        )
+
+    def test_an_infrastructure_error_does_not_discard_the_other_tasks(self) -> None:
+        # A clone that dies must not throw away the batch, and it must not be reported as a
+        # model failure - that would quietly deflate pass@1.
+        tasks = self._write_task_set("mixed.jsonl", ["toy-001", "toy-boom"])
+        real = harness.run_one
+
+        def flaky(task, *args, **kwargs):
+            if task.id == "toy-boom":
+                raise RuntimeError("clone exploded")
+            return real(task, *args, **kwargs)
+
+        with mock.patch.object(harness, "run_agent", scripted_run_agent), mock.patch.object(
+            harness, "run_one", flaky
+        ):
+            code = harness.run_eval(tasks, out_dir=self.tmp / "out-mixed", jobs=2)
+        summary = json.loads((self.tmp / "out-mixed" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["fixed"], 1)
+        self.assertEqual(summary["stages"], {"ok": 1, "harness_error": 1})
+        record = json.loads(
+            (self.tmp / "out-mixed" / "results.jsonl").read_text(encoding="utf-8").splitlines()[1]
+        )
+        self.assertEqual(record["stage"], "harness_error")
+        self.assertIn("clone exploded", record["detail"])
+
     def test_a_task_that_is_not_broken_is_rejected_before_the_agent_runs(self) -> None:
         # PASS_TO_PASS already succeeds, so this task cannot prove anything.
         tasks = self._write_tasks("bad.jsonl", PASS_TO_PASS, [])

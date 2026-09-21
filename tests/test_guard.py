@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from repo_agent.guard import Guard, GuardError, matches, protected_files_in
+from repo_agent.guard import Guard, GuardError, matches, protected_files_in, whole_suite_reason
 
 
 class MatchTests(unittest.TestCase):
@@ -83,6 +83,69 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(guard.check_write("calc/ops.py"), "calc/ops.py")
         with self.assertRaises(GuardError):
             guard.check_write("docs/index.md")
+
+
+class WholeSuiteCommandTests(unittest.TestCase):
+    """Whole-suite runs are the one command shape that cannot be made useful here.
+
+    On these repositories they take minutes, so the sandbox kills them and the model gets an
+    empty observation - the run burns wall clock and learns nothing. The prompt asks for narrow
+    runs; this test pins the part that does not depend on the model agreeing.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_ops.py").write_text("y = 2\n", encoding="utf-8")
+        (self.root / "tests" / "test_util.py").write_text("z = 3\n", encoding="utf-8")
+        self.narrow = "python -m pytest -q tests/test_ops.py"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def reason(self, command: str) -> str | None:
+        return whole_suite_reason(command, self.root, 90.0, self.narrow)
+
+    def test_directory_target_is_refused(self) -> None:
+        self.assertIsNotNone(self.reason("python -m pytest -q tests"))
+        self.assertIsNotNone(self.reason("pytest tests/ -x"))
+        # The shape seen in the real traces: the narrow file plus the whole directory.
+        self.assertIsNotNone(
+            self.reason("D:/repo/.venv/Scripts/python.exe -m pytest -q tests/test_ops.py tests")
+        )
+
+    def test_bare_pytest_is_refused(self) -> None:
+        self.assertIsNotNone(self.reason("pytest"))
+        self.assertIsNotNone(self.reason("python -m pytest -q"))
+
+    def test_narrow_runs_are_allowed(self) -> None:
+        self.assertIsNone(self.reason(self.narrow))
+        self.assertIsNone(self.reason("pytest -q tests/test_ops.py tests/test_util.py"))
+        self.assertIsNone(self.reason("pytest -q tests/test_ops.py::TestOps::test_add"))
+        self.assertIsNone(self.reason("pytest -q tests/test_ops.py -k 'add or sub'"))
+        self.assertIsNone(self.reason("pytest -q -k 'add' -x tests/test_ops.py"))
+        self.assertIsNone(self.reason("pytest --timeout=30 tests/test_ops.py"))
+
+    def test_collection_only_may_scan_everything(self) -> None:
+        self.assertIsNone(self.reason("pytest --collect-only -q tests"))
+        self.assertIsNone(self.reason("pytest --version"))
+
+    def test_the_refusal_names_the_narrow_command(self) -> None:
+        reason = self.reason("pytest -q tests")
+        assert reason is not None
+        self.assertIn(self.narrow, reason)
+        self.assertIn("directory", reason)
+
+    def test_pytest_as_an_argument_is_not_an_invocation(self) -> None:
+        # `rg pytest tests` searches for the word; it does not run the suite.
+        self.assertIsNone(self.reason("rg -n pytest tests"))
+        self.assertIsNone(self.reason("rg -n 'pytest' tests"))
+
+    def test_each_segment_is_checked(self) -> None:
+        self.assertIsNotNone(self.reason("cd tests && pytest -q"))
+        self.assertIsNotNone(self.reason("python -m pytest -q tests/test_ops.py; pytest -q tests"))
+        self.assertIsNotNone(self.reason("pytest -q tests | tail -20"))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ All tool file access goes through :class:`Guard`; nothing else resolves paths.
 from __future__ import annotations
 
 import fnmatch
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -123,3 +124,105 @@ class Guard:
 def protected_files_in(paths: Iterable[str], protected_globs: Iterable[str]) -> list[str]:
     """Used by the patch contract check: which touched files are off-limits."""
     return sorted({normalize(p) for p in paths if matches(p, protected_globs)})
+
+
+#: pytest options that consume the next token. Without this list a `-k expr` value could be
+#: read as a test target, and a target that happens to name a directory is exactly the thing
+#: we are hunting for.
+PYTEST_VALUE_OPTIONS = frozenset(
+    {
+        "-k", "-m", "-p", "-c", "-o", "-n", "-W",
+        "--deselect", "--ignore", "--ignore-glob", "--rootdir", "--timeout", "--maxfail",
+        "--junitxml", "--junit-prefix", "--log-file", "--log-level", "--tb", "--capture",
+        "--durations", "--import-mode", "--basetemp", "--override-ini", "--dist", "--runtest",
+    }
+)
+
+#: Options that make a whole-suite invocation cheap, so they are worth allowing.
+PYTEST_CHEAP_FLAGS = frozenset({"--collect-only", "--co", "--version", "-h", "--help"})
+
+
+def _split_segments(command: str) -> list[str]:
+    """Split on `&&`, `||`, `;`, `|` while respecting quotes."""
+    segments: list[str] = []
+    current: list[str] = []
+    quote = ""
+    for char in command:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+            current.append(char)
+        elif char in ";&|":
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    segments.append("".join(current))
+    return [segment for segment in segments if segment.strip()]
+
+
+def _tokenize(segment: str) -> list[str]:
+    return [token.strip("\"'") for token in re.findall(r'"[^"]*"|\'[^\']*\'|\S+', segment)]
+
+
+def whole_suite_reason(
+    command: str, root: Path, timeout_s: float, narrow: str
+) -> str | None:
+    """Why ``command`` would run an entire test suite, or ``None`` if it is fine.
+
+    A whole-suite run is the one command shape the harness cannot make useful: on these
+    repositories it takes minutes, so it is killed at ``timeout_s`` and returns nothing the
+    model can act on - it only burns wall clock. The prompt asks for narrow runs; this is the
+    part that does not depend on the model agreeing.
+
+    Directory targets and bare ``pytest`` are refused. Several explicit files, node ids and
+    ``-k`` filters stay available, as do collection-only runs (cheap, and the honest way to
+    discover node ids).
+    """
+    root = Path(root)
+    for segment in _split_segments(command):
+        tokens = _tokenize(segment)
+        for index, token in enumerate(tokens):
+            if Path(token.replace("\\", "/")).name.lower() not in {"pytest", "pytest.exe"}:
+                continue
+            # `pytest` is also a perfectly good argument to `rg`/`grep`; only a token that
+            # actually starts an invocation gets to decide what the command runs.
+            if index and tokens[index - 1].lower() != "-m":
+                previous = Path(tokens[index - 1].replace("\\", "/")).name.lower()
+                if previous not in {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}:
+                    continue
+            targets: list[str] = []
+            cheap = False
+            skip_next = False
+            for arg in tokens[index + 1 :]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg.startswith("-"):
+                    if arg in PYTEST_VALUE_OPTIONS:
+                        skip_next = True
+                    if arg in PYTEST_CHEAP_FLAGS:
+                        cheap = True
+                    continue
+                targets.append(arg)
+            if cheap:
+                continue
+            directory = next((t for t in targets if (root / t).is_dir()), None)
+            if directory is not None:
+                return (
+                    f"error: refusing to run the whole test suite - '{directory}' is a directory "
+                    f"target. It takes minutes here, is killed after {timeout_s:.0f}s and returns "
+                    "nothing you can act on. Run the task's test command instead:\n"
+                    f"  {narrow}\n"
+                    "Narrow it with file paths, node ids (path::Class::test) or -k. "
+                    "Use --collect-only if you only need the list of tests."
+                )
+            if not targets:
+                return (
+                    "error: refusing to run pytest with no target - that is the whole suite. "
+                    f"Run the task's test command instead:\n  {narrow}"
+                )
+    return None

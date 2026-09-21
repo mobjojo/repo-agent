@@ -103,6 +103,9 @@ def build_task_message(cfg: RunConfig, overview: str, notes_path: str) -> str:
             "longer than that tells you nothing. Some suites in a repository are far slower than "
             "the code around them (a whole-repo pytest run can take many minutes, and may try to "
             "start local servers). Run the narrow test command above instead of the entire suite.",
+            "- The command tool refuses whole-suite runs outright, so do not plan around them: a "
+            "pytest invocation whose target is a directory (or that has no target) is rejected "
+            "before it runs. Several explicit test files, node ids and -k filters are fine.",
             f"- Shell for the command tool: {shell_hint(cfg)}",
             f"- You may edit: {editable}",
             f"- Protected (read-only) patterns: {', '.join(cfg.protected_globs)}",
