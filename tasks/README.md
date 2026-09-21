@@ -21,7 +21,7 @@
 | `leak_terms` | | 不许出现在 issue 正文里的字符串（修复 SHA、PR 号、修复提交标题）。克隆之前就会被拦下 |
 | `env` | | 任务级环境变量，同时注入 Agent 沙箱与判定命令，如 `{"PYTHONPATH": "src"}` |
 | `protected_globs` | | 覆盖默认的只读范围（默认已含 `**/tests/**`、`**/test_*.py`、`**/setup.cfg` 等） |
-| `model` / `max_steps` | | 单任务覆盖模型或步数预算 |
+| `model` / `max_steps` / `max_tokens` | | 单任务覆盖模型、步数上限或 token 上限（两者都由 `tools/calibrate_budget.py` 标定，见下节） |
 
 ## 从一条真实修复造一个任务
 
@@ -100,6 +100,50 @@ Agent 一句 `git show <fix-sha>` 就能抄答案，而所有指标看上去都�
 
 20 条全部通过 `--check-only`（修前必失败 + gold 补丁必转绿 + `pass_to_pass` 不回归）。
 真实批次数字见 `../BASELINE.md`。
+
+### 预算标定（上限 = 1.5 × 观测成功上限）
+
+`max_steps` / `max_tokens` 不是难度旋钮，是**量程**。任务在量程上被掐断，分数就变成关于预算的、
+而不是关于模型的：默认 20 步 / 200k token 那一轮（`m3-golden-20-j4b`），20 条里有 5 条是撞天花板
+停的（`budget:tokens` 4 + `budget:steps` 1），其中 3 条其实已经改对、只是没走到 `submit`——
+终止时照常采集工作区 diff 的设计把它们救了回来，代价是"通过"变成了"天花板恰好落在哪一步"的函数，
+而那是整条链路上最不可复现的量。
+
+规则（`python tools/calibrate_budget.py`，可复跑；`--dry-run` 只看不写，`--markdown` 输出下表）：
+
+- **上限 = 1.5 × 已观测"成功"样本里的最大值**，步数向上取整到 5、token 到 5 万；
+- 下限 20 步 / 200k token（不设得比默认更紧）；
+- 某条任务从未成功过 → 没有成功样本可标定，退回"已观测到的最大消耗（含被掐断的）" × 1.5，
+  否则天花板会正好卡在它每次死掉的位置；
+- **只喂同一个模型的批次**：步数与 token 是模型相关的（`deepseek-flash` 探路时单条就到 20 万）。
+
+| 任务 | 观测成功上限（步数 / token） | 预算（步数 / token） |
+| --- | --- | --- |
+| `itsdangerous-126` | 11 步 / 66,709 | **20 步 / 200,000** |
+| `itsdangerous-124` | 11 步 / 74,872 | **20 步 / 200,000** |
+| `itsdangerous-296` | 12 步 / 99,197 | **20 步 / 200,000** |
+| `click-echo-empty` | 16 步 / 122,464 | **25 步 / 200,000** |
+| `click-funcparamtype` | 8 步 / 39,305 | **20 步 / 200,000** |
+| `click-show-default` | 20 步 / 209,501 | **30 步 / 350,000** |
+| `click-unset-defaults` | 17 步 / 216,798 | **30 步 / 350,000** |
+| `packaging-wheel-regex` | 14 步 / 92,894 | **25 步 / 200,000** |
+| `packaging-tag-count` | 11 步 / 79,524 | **20 步 / 200,000** |
+| `packaging-dep-groups` | 9 步 / 89,034 | **20 步 / 200,000** |
+| `werkzeug-range-zero` | 16 步 / 118,533 | **25 步 / 200,000** |
+| `werkzeug-if-range-etag` | 15 步 / 129,124 | **25 步 / 200,000** |
+| `werkzeug-int-url` | 10 步 / 75,789 | **20 步 / 200,000** |
+| `packaging-interp-tags` | 17 步 / 215,200 | **30 步 / 350,000** |
+| `packaging-specifier-group` | 8 步 / 53,624 | **20 步 / 200,000** |
+| `werkzeug-int-str-strict` | 20 步 / 184,739 | **30 步 / 300,000** |
+| `werkzeug-route-sort` | 19 步 / 201,530 | **30 步 / 350,000** |
+| `werkzeug-url-empty-port` | 14 步 / 129,046 | **25 步 / 200,000** |
+| `click-deprecated-label` | 14 步 / 111,362 | **25 步 / 200,000** |
+| `itsdangerous-tz-aware` | 15 步 / 134,401 | **25 步 / 250,000** |
+
+标定后那一轮（`m3-golden-20-budget`）的结论值得单独写下来，因为它**不是**"预算放开就好了"：
+17 个通过全部以 `submitted` 收尾、撞线的 3 条全是真失败（对照 j4b 的 5 条撞线里 3 条被救回），
+但 `packaging-interp-tags` 用掉 367k token 仍然交白卷、`click-unset-defaults` 350k 用尽仍是空补丁。
+**加预算不能把"不会"变成"会"，它只把"通过"从天花板里摘出来**，代价是失败更贵（平均 token +6%）。
 
 环境依赖：三条 packaging 任务需要 `pretend`；三条 werkzeug 任务的 `tests/conftest.py`
 需要 `ephemeral-port-reserve`（连同 `pytest-timeout`、`watchdog`、`cffi`、`cryptography`
