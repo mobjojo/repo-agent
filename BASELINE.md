@@ -159,6 +159,42 @@
     可压缩空间：硬阻断整仓 pytest（−23%）+ 并发并把验证与下一条任务重叠（÷3），
     一批 975s → 250–300s，成本不变。这也是后面每个 Step 迭代变快的复利所在。
 
+19. **"整批墙钟"曾经是个错的数——而它恰好是并发工作的唯一验收指标。** `tools/daily_report.py`
+    把这一列算成逐条 `duration_s` 之和：`--jobs 4` 那行写 674.5s，真实墙钟 171.8s，
+    而同一行的说明列还写着"187s"，一行之内自相矛盾。现在改成从 trace 实测
+    （首条 `run_start` → 末条 `run_end`），缺 `run_end` 的中断批次退回求和并标 `~`；
+    已有批次行按新口径刷新（串行批次也略变小，因为求和把任务之间的间隔也算成了运行时）。
+    教训：**汇总口径一错，再好的实验也说不清结论**——并发的收益正是被这个数抹掉的。
+
+20. **凭证/模型名错误会被记成"模型失败"。** 漏设 `DEEPSEEK_API_KEY` 的那一轮，
+    模型调用抛 `AuthenticationError` → 循环记 `llm_error` 停止 → 无补丁 → 20 行 `empty_patch`，
+    40 秒跑完。表上看起来是"模型一条都没改对"，实际上一次模型都没调到（token 花费为 0）。
+    修法两层：`run_one` 把"零 token 就 `llm_error`"判成 `llm_error` 阶段（与 `harness_error` 同类，
+    不计入模型失败），并且批次开始前先做一次 16-token 预检，密钥或模型名不对就立刻退出、不写批次
+    （模型名写成 `deepseek-v4.1-flash` 会 400，同样属于该拦下的错误）。
+
+21. **每条结果行现在自带 `budget` 字段（当轮生效的上限）。** 今天真出现过一次"任务文件悄悄回到
+    默认值、整批在 20 步 / 200k 下跑完、却被当成预算实验"的情况。上限必须跟着结果走，
+    不能只留在输入里——否则一个实验批次看起来和另一个一样，实际什么都没改。
+
+22. **并发 4 实测：762.6s → 171.8s（4.4x），pass@1 与串行一致（18/20），0 次超时。**
+    `--jobs` 只压缩墙钟：任务级异常单独记 `harness_error`，结果文件按任务集顺序重排，
+    所以基线表不会被打乱。同配置复跑一轮（`j4c`）拿到 19/20 ——**同一份代码、同一份任务集、
+    同一个模型，两次差 1 条**，这是批次级波动的下限，也是对外只能给区间的原因。
+
+23. **Step 5 收口：预算标定（上限 = 1.5 × 观测成功上限）后波动仍未达标，但归因清楚了。**
+    近 7 轮同 20 条任务：15 条 7/7 全胜、4 条波动、1 条全败，pass@1 区间 **85–95%**。
+    4 条波动任务的共同点是**几乎每一轮都由天花板终止**：`click-show-default` 7/7 撞线、
+    `packaging-interp-tags` 7/7 撞线、`click-unset-defaults` 6/7 撞线（另 1 轮 `agent_finished` 交白卷）、
+    `werkzeug-int-str-strict` 2/7（另有一次 `no_progress` 熔断）。反过来，会自己 `submit` 的 16 条
+    近 7 轮零波动。**所以波动不是"模型随机"，而是"这一次的终点由天花板决定"**——
+    天花板落在哪一步取决于该步的累计 token，是最不可复现的量。
+    标定确实摘掉了"靠终止后回收 diff 得到的通过"（这一轮 17 个通过全部以 `submitted` 收尾，
+    对照 j4b 的 5 条撞线里 3 条被救回），但它**不能把"不会"变成"会"**：
+    `packaging-interp-tags` 用掉 367k token 仍交白卷，`click-unset-defaults` 350k 用尽仍空补丁，
+    代价是失败更贵（平均 token 108,511 → 115,393）。下一步的正确动作是让这些任务**能收尾**
+    （接近量程时注入"现在必须提交"），而不是继续加量程。
+
 ## 复现命令
 
 ```powershell
@@ -172,4 +208,18 @@ $env:PYTHONUTF8 = "1"
 # 真跑 + 计分（产物保留在 eval-runs\<批次>\artifacts\<任务id>\）
 .\.venv\Scripts\python.exe -m repo_agent eval --tasks tasks\golden.jsonl `
   --model deepseek/deepseek-chat --out eval-runs\m3-20260918b
+
+# 并发 4（只压缩墙钟，pass@1 不变；约 3–4 分钟 / $0.22）
+.\.venv\Scripts\python.exe -m harness.run_eval --tasks tasks\golden.jsonl `
+  --model deepseek/deepseek-chat --jobs 4 --out eval-runs\<批次>
+
+# 定向探路：只跑某几条任务（几分钱），用来确认某个改动真的被触发
+.\.venv\Scripts\python.exe -m harness.run_eval --tasks tasks\golden.jsonl `
+  --model deepseek/deepseek-chat --only click-unset-defaults --out eval-runs\<批次>
+
+# 重新标定预算：从历史批次反推每条任务的上限
+.\.venv\Scripts\python.exe tools\calibrate_budget.py --dry-run --markdown
+
+# 留档：把批次数字写进工作日志的表格（重复运行是替换，不是追加）
+.\.venv\Scripts\python.exe tools\daily_report.py <批次> --note "说明"
 ```
