@@ -11,8 +11,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from repo_agent.config import Budget
 from repo_agent.llm import ScriptedLLM
-from repo_agent.runner import run_agent as real_run_agent
+from repo_agent.runner import RunResult, run_agent as real_run_agent
 from tests.make_toy_repo import build_toy_repo
 from tests.test_loop_e2e import fixing_script
 
@@ -179,21 +180,27 @@ class HarnessTests(unittest.TestCase):
     def test_check_only_rejects_a_gold_patch_that_does_not_solve_the_task(self) -> None:
         # A patch that applies but leaves the failing test failing means the fixture, the
         # node ids or the env are wrong: the task would be scored as a miss forever.
-        gold = self.tmp / "gold-bad.patch"
-        gold.write_text(
-            "diff --git a/README.md b/README.md\n"
-            "--- a/README.md\n"
-            "+++ b/README.md\n"
-            "@@ -1,3 +1,3 @@\n"
-            " # toyrepo\n"
-            "\n"
-            "-A deliberately broken two-function package.\n"
-            "+Still broken.\n",
-            encoding="utf-8",
-            newline="\n",
+        #
+        # The refusal has to come from *that* check. A patch that merely fails to apply is
+        # refused one branch earlier, so a hand-written hunk that has drifted out of date
+        # silently stops covering this path - which is what had happened here. Take the
+        # patch from a real edit instead, and assert on the reason, not just the exit code.
+        readme = self.repo / "README.md"
+        original = readme.read_text(encoding="utf-8")
+        readme.write_text("# toyrepo\n\nStill broken.\n", encoding="utf-8", newline="\n")
+        code, diff = harness.run_shell("git diff", self.repo)
+        readme.write_text(original, encoding="utf-8", newline="\n")
+        self.assertEqual(code, 0, diff)
+        (self.tmp / "gold-bad.patch").write_text(diff, encoding="utf-8", newline="\n")
+        tasks = self._write_tasks(
+            "gold-bad.jsonl", FAIL_TO_PASS, PASS_TO_PASS, gold=Path("gold-bad.patch")
         )
-        tasks = self._write_tasks("gold-bad.jsonl", FAIL_TO_PASS, PASS_TO_PASS, gold=gold)
         self.assertEqual(harness.run_eval(tasks, check_only=True), 1)
+        outcome = harness.run_one(
+            harness.load_tasks(tasks)[0], self.tmp / "work", None, None, pre_check_only=True
+        )
+        self.assertEqual(outcome.stage, "gold_check")
+        self.assertIn("leaves", outcome.detail)
 
     def test_verification_commands_leave_no_bytecode_behind(self) -> None:
         # Stale bytecode is invisible and cuts both ways: Python reuses a .pyc when the
@@ -224,6 +231,87 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(captured["env"], {"TASK_FLAG": "1"})
         self.assertEqual(code, 0)
         self.assertEqual(summary["stages"], {"ok": 1})
+
+    def test_task_budget_overrides_reach_the_agent_and_leave_the_rest_alone(self) -> None:
+        # Both ceilings are part of the measurement: a run cut off by the step ceiling and
+        # one cut off by the token ceiling are both scored as misses, so a task file has to
+        # be able to raise either one - without resetting the other to its dataclass default.
+        tasks = self._write_tasks("budget.jsonl", FAIL_TO_PASS, PASS_TO_PASS)
+        task = json.loads(tasks.read_text(encoding="utf-8"))
+        del task["max_steps"]
+        task["max_tokens"] = 250_000
+        tasks.write_text(json.dumps(task) + "\n", encoding="utf-8", newline="\n")
+        captured: dict[str, object] = {}
+
+        def capture(cfg, reference_repo=None, **kwargs):
+            captured["budget"] = cfg.budget
+            return real_run_agent(
+                cfg, llm=ScriptedLLM(fixing_script()), reference_repo=reference_repo
+            )
+
+        with mock.patch.object(harness, "run_agent", mock.MagicMock(side_effect=capture)):
+            code = harness.run_eval(tasks, out_dir=self.tmp / "out-budget")
+        budget = captured["budget"]
+        self.assertEqual(code, 0)
+        self.assertEqual(budget.max_tokens, 250_000)
+        self.assertEqual(budget.max_steps, Budget().max_steps)
+        # The row has to record the ceiling that was in force. A task file that silently
+        # lost its calibrated numbers otherwise yields a batch that looks like a budget
+        # experiment - which is how a whole batch once ran on defaults unnoticed.
+        rows = (self.tmp / "out-budget" / "results.jsonl").read_text(encoding="utf-8")
+        row = json.loads(rows.splitlines()[0])
+        self.assertEqual(row["budget"]["max_tokens"], 250_000)
+        self.assertEqual(row["budget"]["max_steps"], Budget().max_steps)
+
+    def test_a_model_that_never_answered_is_not_scored_as_a_model_failure(self) -> None:
+        # A rejected key makes every model call raise, and the loop reports that as a run
+        # with no patch. Left as empty_patch it reads as "the agent changed nothing": a
+        # whole batch of failures that never happened, in a table that looks perfectly fine.
+        tasks = self._write_tasks("llm-error.jsonl", FAIL_TO_PASS, PASS_TO_PASS)
+        unanswered = RunResult(
+            task="toy-001",
+            stop_reason="llm_error",
+            steps=1,
+            tokens=0,
+            cost_usd=0.0,
+            duration_s=0.1,
+            submitted=False,
+            patch="",
+            patch_path="",
+            run_dir="",
+            error="AuthenticationError: DeepseekException - Authentication Fails",
+        )
+        with mock.patch.object(harness, "run_agent", lambda *args, **kwargs: unanswered):
+            outcome = harness.run_one(
+                harness.load_tasks(tasks)[0], self.tmp / "work", None, None
+            )
+        self.assertEqual(outcome.stage, "llm_error")
+        self.assertFalse(outcome.fixed)
+        self.assertIn("Authentication", outcome.detail)
+
+    def test_an_unusable_model_is_refused_before_any_task_is_cloned(self) -> None:
+        # Same reasoning one level up: proving the model works costs one 16-token call and
+        # saves the whole batch, so a bad key or a mistyped model name must not be able to
+        # produce twenty rows of evidence.
+        tasks = self._write_tasks("preflight.jsonl", FAIL_TO_PASS, PASS_TO_PASS)
+        out_dir = self.tmp / "out-preflight"
+        with mock.patch.object(
+            harness, "preflight_model", return_value="AuthenticationError: nope"
+        ) as preflight, mock.patch.object(
+            harness, "run_agent", side_effect=AssertionError("no task may run")
+        ):
+            code = harness.run_eval(tasks, out_dir=out_dir, model="deepseek/deepseek-chat")
+        self.assertEqual(code, 2)
+        preflight.assert_called_once_with("deepseek/deepseek-chat")
+        self.assertFalse((out_dir / "results.jsonl").exists())
+
+    def test_check_only_never_calls_the_model(self) -> None:
+        # --check-only has to stay free: it is meant to be run before every batch.
+        tasks = self._write_tasks("check-only-free.jsonl", FAIL_TO_PASS, PASS_TO_PASS)
+        with mock.patch.object(
+            harness, "preflight_model", side_effect=AssertionError("must not be called")
+        ):
+            self.assertEqual(harness.run_eval(tasks, check_only=True), 0)
 
     def test_run_evidence_survives_the_temporary_work_root(self) -> None:
         run_dir = self.tmp / "run-evidence"

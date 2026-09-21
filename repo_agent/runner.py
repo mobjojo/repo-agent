@@ -112,6 +112,10 @@ def run_agent(
     result = RunResult(
         task=cfg.task,
         stop_reason=str(final.get("stop_reason", "")),
+        # An outage inside the loop never raises out of graph.invoke, so the message has to
+        # come off the state - otherwise every provider failure reaches the caller as an
+        # empty, un-explained error string.
+        error=error or str(final.get("last_error", "")),
         steps=int(final.get("steps", 0)),
         tokens=int(final.get("tokens", 0)),
         cost_usd=float(final.get("cost_usd", 0.0)),
@@ -127,7 +131,6 @@ def run_agent(
         removed_lines=int(final.get("removed_lines", 0)),
         notes_path=str(notes_path) if keep_notes else "",
         trace_path=str(tracer.path) if tracer.path else "",
-        error=error,
     )
     tracer.event(
         "run_end",

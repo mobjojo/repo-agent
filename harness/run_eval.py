@@ -76,6 +76,12 @@ class Task:
     leak_terms: list[str] = field(default_factory=list)
     model: str | None = None
     max_steps: int | None = None
+    # Both ceilings have to be non-binding for the score to be about the model rather than
+    # about the budget. On the 2026-09-21 default-budget batch (m3-golden-20-j4b) five runs
+    # ended on a ceiling and three of those had already produced a correct patch - their
+    # verdict was decided by where the ceiling happened to land, not by the agent.
+    # tasks/README.md derives both numbers from the observed successful runs.
+    max_tokens: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "Task":
@@ -104,6 +110,11 @@ class TaskOutcome:
     detail: str = ""
     run_dir: str = ""
     base_commit: str = ""
+    #: The ceilings that were actually in force for this row. A batch is often an
+    #: experiment *on* the budget, and a task file that quietly lost its calibrated
+    #: numbers produces a run that looks like that experiment and is not - the numbers
+    #: have to travel with the result, not only with the input.
+    budget: dict[str, float] = field(default_factory=dict)
 
 
 def run_shell(
@@ -182,6 +193,27 @@ def issue_leak(task: Task) -> str | None:
     if not found:
         return None
     return "issue text leaks provenance: " + ", ".join(repr(term) for term in found)
+
+
+def preflight_model(model: str) -> str | None:
+    """One cheap call before the batch: prove the key and the model name actually work.
+
+    The loop turns any provider error into a stopped run with no patch, so an unusable
+    model reaches the results file as a row of ``empty_patch`` - twenty model failures that
+    never happened. A mistyped model name and a missing key are the two most common ways to
+    lose a batch this way, and both are free to detect up front.
+    """
+    from langchain_core.messages import HumanMessage
+
+    from repo_agent.llm import LiteLLMClient
+
+    try:
+        LiteLLMClient(model, max_tokens=16, timeout=60.0).complete(
+            [HumanMessage(content="Reply with the single word: ok")]
+        )
+    except Exception as exc:  # noqa: BLE001 - any transport or auth error is the answer
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 def check_gold(task: Task, verify: Path) -> tuple[bool, str]:
@@ -266,8 +298,11 @@ def run_one(
         run_dir=task_root / "run",
         env=dict(task.env),
     )
-    if task.max_steps:
-        cfg.budget = Budget(max_steps=task.max_steps)
+    if task.max_steps or task.max_tokens:
+        cfg.budget = Budget(
+            max_steps=task.max_steps or cfg.budget.max_steps,
+            max_tokens=task.max_tokens or cfg.budget.max_tokens,
+        )
     if task.protected_globs:
         cfg.protected_globs = tuple(task.protected_globs)
     if task.editable_globs:
@@ -288,7 +323,18 @@ def run_one(
         detail=result.error,
         run_dir=result.run_dir,
         base_commit=base_commit,
+        budget={
+            "max_steps": cfg.budget.max_steps,
+            "max_tokens": cfg.budget.max_tokens,
+        },
     )
+    if result.stop_reason == "llm_error" and result.tokens == 0:
+        # The model was never reached, so there is nothing to score. Reporting this as
+        # empty_patch ("the agent changed nothing") would blame the wrong thing; a wrong
+        # key or a rate limit belongs in the same bucket as a failed clone.
+        outcome.stage = "llm_error"
+        outcome.detail = result.error or "the model call failed before any tokens were billed"
+        return outcome
     if not result.patch.strip():
         outcome.stage = "empty_patch"
         return outcome
@@ -473,6 +519,16 @@ def run_eval(
         tasks = [task for task in tasks if task.id in wanted]
     if limit:
         tasks = tasks[:limit]
+    if model and not check_only:
+        failure = preflight_model(model)
+        if failure:
+            print(f"model '{model}' is not usable: {failure}", file=sys.stderr)
+            print(
+                "refusing to start: every task would be recorded as an empty patch. "
+                "Check DEEPSEEK_API_KEY and the model name (deepseek/deepseek-chat).",
+                file=sys.stderr,
+            )
+            return 2
     out_dir = out_dir or Path("eval-runs") / time.strftime("%Y%m%d-%H%M%S")
     work_root = Path(tempfile.mkdtemp(prefix="repo-agent-eval-"))
     print(f"tasks: {len(tasks)}/{len(known)}   jobs: {jobs}   work root: {work_root}")

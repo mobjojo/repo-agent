@@ -22,6 +22,10 @@ class AgentState(TypedDict, total=False):
     started_at: float
     submitted: bool
     stop_reason: str
+    # Why the loop stopped when the reason was not the model's idea (a provider outage, a
+    # rejected key). Carried in the state so the harness can tell "the model gave up" from
+    # "there was never an answer to score".
+    last_error: str
     # Rolling window of recent tool signatures, used to detect no-progress loops.
     recent_calls: list[str]
     final_patch: str
@@ -43,6 +47,7 @@ def initial_state(cfg: RunConfig, task_message: str) -> AgentState:
         started_at=time.time(),
         submitted=False,
         stop_reason="",
+        last_error="",
         recent_calls=[],
         final_patch="",
         touched_files=[],

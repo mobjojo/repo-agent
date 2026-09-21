@@ -16,7 +16,9 @@ from tools.daily_report import (
     END,
     START,
     ReportError,
+    existing_note,
     format_row,
+    main,
     summarize,
     upsert_row,
 )
@@ -45,6 +47,17 @@ def row(task: str, fixed: bool, stage: str) -> dict:
         "cost_usd": 0.004,
         "duration_s": 20.0,
     }
+
+
+def add_trace(batch: Path, task: str, start: float, end: float | None) -> None:
+    events = [{"ts": start, "kind": "run_start", "model": "deepseek/deepseek-chat"}]
+    if end is not None:
+        events.append({"ts": end, "kind": "run_end"})
+    target = batch / "artifacts" / task
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "trace.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
+    )
 
 
 class SummarizeTests(unittest.TestCase):
@@ -88,6 +101,43 @@ class SummarizeTests(unittest.TestCase):
         self.assertIn("| `batch-x` | `deepseek/deepseek-chat` | 1 |", text)
         self.assertIn("**1/1 (100%)**", text)
         self.assertTrue(text.endswith("| note |"))
+
+    def test_wall_clock_is_measured_not_summed(self) -> None:
+        # The sum of per-task durations is 4x the wall clock on a --jobs 4 batch, and wall
+        # clock is the number the concurrency work is judged by. Two tasks overlapping in
+        # time must not add up.
+        batch = make_batch(self.root, [row("a", True, "ok"), row("b", True, "ok")])
+        add_trace(batch, "toy-001", start=100.0, end=120.0)
+        add_trace(batch, "waiting", start=110.0, end=130.0)
+        summary = summarize(batch)
+        self.assertEqual(summary["wall_s"], 30.0)
+        self.assertTrue(summary["wall_is_measured"])
+        self.assertIn("| 30.0s |", format_row("batch-x", summary, "note"))
+
+    def test_an_interrupted_batch_falls_back_to_the_sum_and_says_so(self) -> None:
+        # No run_end means the batch never finished, so there is no wall clock to report.
+        batch = make_batch(self.root, [row("a", True, "ok"), row("b", True, "ok")])
+        add_trace(batch, "toy-001", start=100.0, end=120.0)
+        add_trace(batch, "waiting", start=110.0, end=None)
+        summary = summarize(batch)
+        self.assertEqual(summary["wall_s"], 40.0)
+        self.assertFalse(summary["wall_is_measured"])
+        self.assertIn("| ~40.0s |", format_row("batch-x", summary, "note"))
+
+    def test_a_note_is_read_back_so_a_refresh_can_keep_it(self) -> None:
+        # Refreshing a row (new numbers, same experiment) must not need the note retyped:
+        # that is exactly how a table ends up with half-empty descriptions.
+        lines = [START, "| `batch-x` | 1 | 说明文字 |", END]
+        self.assertEqual(existing_note(lines, "batch-x"), "说明文字")
+        self.assertEqual(existing_note(lines, "other"), "")
+        log = self.root / "log.md"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        batch = make_batch(self.root, [row("a", True, "ok")])
+        self.assertEqual(main(["batch-x", "--runs", str(self.root), "--log", str(log)]), 0)
+        written = log.read_text(encoding="utf-8")
+        self.assertNotIn("| `batch-x` | 1 | 说明文字 |", written)
+        self.assertIn("说明文字 |", written)
+        self.assertIn("**1/1 (100%)**", written)
 
 
 class UpsertTests(unittest.TestCase):

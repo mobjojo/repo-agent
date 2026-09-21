@@ -128,6 +128,7 @@ def _agent_node(deps: GraphDeps) -> Callable[[AgentState], dict[str, Any]]:
             return {
                 "messages": [AIMessage(content=f"model call failed: {exc}")],
                 "stop_reason": "llm_error",
+                "last_error": f"{type(exc).__name__}: {exc}",
                 "steps": state.get("steps", 0) + 1,
             }
         steps = state.get("steps", 0) + 1

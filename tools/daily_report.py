@@ -53,6 +53,8 @@ def summarize(batch_dir: Path) -> dict[str, object]:
         raise ReportError(f"{results} is empty")
     total = len(rows)
     fixed = sum(1 for row in rows if row["fixed"])
+    wall = wall_seconds(batch_dir)
+    durations = sum(row["duration_s"] for row in rows)
     stages: dict[str, int] = {}
     for row in rows:
         stages[row["stage"]] = stages.get(row["stage"], 0) + 1
@@ -66,10 +68,56 @@ def summarize(batch_dir: Path) -> dict[str, object]:
         "avg_tokens": sum(row["tokens"] for row in rows) / total,
         "avg_cost": sum(row["cost_usd"] for row in rows) / total,
         "avg_duration": sum(row["duration_s"] for row in rows) / total,
-        "wall_s": sum(row["duration_s"] for row in rows),
+        # Wall clock is the number the concurrency work is judged by, and it is *not* the
+        # sum of per-task durations: at --jobs 4 that sum is four times too large.
+        "wall_s": wall if wall is not None else durations,
+        "wall_is_measured": wall is not None,
         "cost_usd": sum(row["cost_usd"] for row in rows),
         "stop_reasons": _counts(row.get("stop_reason", "") for row in rows),
     }
+
+
+def wall_seconds(batch_dir: Path) -> float | None:
+    """First task start to last task end, straight off the traces.
+
+    Returns None when any task's trace is missing its ``run_end`` (an interrupted batch),
+    because a half-finished batch has no wall clock - the caller falls back to the sum and
+    marks the number as approximate.
+    """
+    traces = sorted((batch_dir / "artifacts").glob("*/trace.jsonl"))
+    if not traces:
+        return None
+    starts: list[float] = []
+    ends: list[float] = []
+    for trace in traces:
+        trace_start = trace_end = None
+        for line in trace.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            stamp = event.get("ts")
+            if not isinstance(stamp, (int, float)):
+                continue
+            if event.get("kind") == "run_start" and trace_start is None:
+                trace_start = float(stamp)
+            elif event.get("kind") == "run_end":
+                trace_end = float(stamp)
+        if trace_start is None or trace_end is None:
+            return None
+        starts.append(trace_start)
+        ends.append(trace_end)
+    return max(ends) - min(starts)
+
+
+def existing_note(lines: list[str], batch: str) -> str:
+    """The note already written for this batch, so a refresh does not need it retyped."""
+    key = f"| `{batch}` |"
+    for line in lines:
+        if line.startswith(key) and line.endswith("|"):
+            cells = line.split(" | ")
+            if len(cells) >= 2:
+                return cells[-1].rstrip(" |").strip()
+    return ""
 
 
 def batch_model(batch_dir: Path) -> str:
@@ -91,11 +139,12 @@ def batch_model(batch_dir: Path) -> str:
 
 def format_row(batch: str, summary: dict[str, object], note: str) -> str:
     fixed, tasks = summary["fixed"], summary["tasks"]
+    wall = f"{summary['wall_s']:.1f}s" if summary["wall_is_measured"] else f"~{summary['wall_s']:.1f}s"
     return (
         f"| `{batch}` | `{summary['model']}` | {tasks} | **{fixed}/{tasks} ({summary['pass_at_1']:.0%})** "
         f"| {summary['avg_steps']:.2f} | {summary['avg_tokens']:,.0f} "
         f"| ${summary['avg_cost']:.4f} | {summary['avg_duration']:.1f}s "
-        f"| {summary['wall_s']:.1f}s | ${summary['cost_usd']:.4f} | {note} |"
+        f"| {wall} | ${summary['cost_usd']:.4f} | {note} |"
     )
 
 
@@ -148,7 +197,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("batch", help="batch name under eval-runs/")
     parser.add_argument("--runs", default="eval-runs", help="directory holding batches")
     parser.add_argument("--log", default="工作日志.md")
-    parser.add_argument("--note", default="", help="free-text note for the last column")
+    parser.add_argument(
+        "--note",
+        default="",
+        help="free-text note for the last column; empty keeps the note already in the log",
+    )
     parser.add_argument("--docx", action="store_true", help="re-render the .docx next to the log")
     parser.add_argument("--outputs", default=None, help="copy log + docx here, dated")
     parser.add_argument("--date", default=None, help="date prefix for --outputs (default: today)")
@@ -158,14 +211,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     summary = summarize(Path(args.runs) / args.batch)
-    row = format_row(args.batch, summary, args.note)
+    log = Path(args.log)
+    lines = log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+    note = args.note or existing_note(lines, args.batch)
+    row = format_row(args.batch, summary, note)
     print(row)
     print(stage_line(summary))
     if args.print_only:
         return 0
 
-    log = Path(args.log)
-    lines = log.read_text(encoding="utf-8").splitlines()
     body = "\n".join(upsert_row(lines, args.batch, row)) + "\n"
     log.write_text(body, encoding="utf-8", newline="\n")
     print(f"updated {log}")
