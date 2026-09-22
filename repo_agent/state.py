@@ -28,6 +28,11 @@ class AgentState(TypedDict, total=False):
     last_error: str
     # Rolling window of recent tool signatures, used to detect no-progress loops.
     recent_calls: list[str]
+    #: Whether a source file (not a scratch script) has been written to yet, and how many
+    #: budget warnings have been sent. Both feed the budget nudge: "start editing" and
+    #: "stop exploring" are different messages, and neither may repeat every step.
+    edited_source: bool
+    nudge_level: int
     final_patch: str
     touched_files: list[str]
     contract_violations: list[str]
@@ -49,6 +54,8 @@ def initial_state(cfg: RunConfig, task_message: str) -> AgentState:
         stop_reason="",
         last_error="",
         recent_calls=[],
+        edited_source=False,
+        nudge_level=0,
         final_patch="",
         touched_files=[],
         contract_violations=[],

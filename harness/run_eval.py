@@ -510,7 +510,14 @@ def run_eval(
     tasks = load_tasks(tasks_path)
     known = {task.id for task in tasks}
     if only:
-        wanted = {name.strip() for name in only if name.strip()}
+        # Both spellings are natural (`--only a --only b` and `--only a,b`), and picking the
+        # wrong one used to look like a typo in the task id.
+        wanted = {
+            name.strip()
+            for value in only
+            for name in value.split(",")
+            if name.strip()
+        }
         missing = sorted(wanted - known)
         if missing:
             print(f"unknown task id(s): {', '.join(missing)}", file=sys.stderr)

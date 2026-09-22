@@ -203,6 +203,29 @@
     造成的混合单价差异（实测 chat ~$0.09/M token、flash ~$0.044/M token，都远低于价目表），
     **不能当作"更便宜"的证据**；比较模型要看步数与 token 的分项。
 
+25. **预算感知提示把“零源码编辑”这一类失败彻底消掉了（11/15 → 0/2）。** 先画像再动手：近 7 轮 140 次运行、
+    15 次失败，其中 **11 次全程没编辑过任何源码**——token 全烧在 `view` / `bash` 侦察上，`stop_reason`
+    多为 `budget:tokens`（最极端是 `click-unset-defaults` 在标定那轮：25 步 / 359,044 token / 空补丁）。
+    于是加两档提示：用量的 70%（预警）与 85%（最后通牒），**各只发一次**；文案按“有没有编辑过源码”分叉；
+    是否算“编辑过”只看 `.repo-agent/` 之外的 `create_file` / `replace_in_file` / `insert_lines`
+    （否则写个调试 scratch 脚本就会被当成“已经动手”）。`budget_pressure()` 取步数 / token / 墙钟三条天花板里
+    **最近**的那条决定档位。结果（提示后 3 轮 60 次运行）：**失败 2 次、零源码编辑 0 次**；13 次运行收到提示，
+    `packaging-interp-tags` 在 step 20 收到预警、step 21/22 即落成 `replace_in_file src/packaging/tags.py`
+    （此前 7/7 轮一次源码都没碰）。逐任务：`click-unset-defaults` 0/7 → 1/3、`click-show-default` 4/7 → 3/3、
+    `packaging-interp-tags` 4/7 → 3/3、`werkzeug-int-str-strict` 6/7 → 3/3。
+    诚实边界：**提示把“不可复现的终点”变成了“可复现的自助收尾”，没有把“不会”变成“会”**——
+    `click-unset-defaults` 3 轮里 2 次仍是撞线后回收 diff 才通过，且提示后仅有的 2 次失败全来自它。
+    出处：`m3-nudge-only`（定向 3 条 3/3）、`m3-golden-20-nudge` 19/20、`nudge2` 19/20、`nudge3` **20/20**。
+
+26. **提示的副作用：Agent 变“更执着于再确认一遍”，一条任务吃掉整批 84% 的墙钟。** `m3-golden-20-nudge3`
+    整批墙钟 611.6s，其中 `werkzeug-int-str-strict` 一条 **513.5s**：30 步里连撞 **5 次 90s 命令超时**
+    （`pytest tests/test_serving.py::test_chunked_request`、`git stash && pytest ...`、多文件 pytest 连跑），
+    451.5s 全花在等超时上；全批 bash 合计 665s，这一条占 68%。被催之后它的选择是“再跑一遍测试”而不是“提交”。
+    候选动作：命令超时 90 → 45s（单变量）、重复跑同类 pytest 合并或阻断、提示文案把“跑复现命令”限定为至多一次。
+    两个附带观察：① `git stash` 这类**会改工作区**的命令现在没有被 guard 拦（三个批次里共 21 次调用，
+    分布在 `click-echo-empty` / `werkzeug-int-str-strict` / `click-unset-defaults`），好在成对 `pop` 了、
+    没有丢 diff，但这是个真实的护栏缺口；② 模型调用延迟没有变化（中位 0.9–1.1s），墙钟变长**全是 bash**。
+
 ## 复现命令
 
 ```powershell

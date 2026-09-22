@@ -1,10 +1,11 @@
-# repo-agent — 仓库级 AI Coding Agent（20 条真实任务 / 4 个上游仓库，pass@1 75–95%）
+# repo-agent — 仓库级 AI Coding Agent（20 条真实任务 / 4 个上游仓库，pass@1 75–100%）
 
 输入一个 Issue 和一个仓库检出，输出一个**可 `git apply` 的统一 diff**。
 M1 是行走骨架（闭环能跑），M2 把它对上真实世界（`pallets/itsdangerous` 3 条，pass@1 3/3），
 M3 把任务集扩到 20 条、覆盖 4 个真实仓库（itsdangerous / click / packaging / werkzeug），
-同一批任务连跑 9 轮（含 4 轮并发与 1 轮预算标定），pass@1 区间 75–95%，**近 7 轮 85–95%**
-（15 条 7/7 全胜、4 条波动、1 条全败，**未达 Step 5 的 ≤ 1 条**）。
+同一批任务连跑 12 轮（含 4 轮并发、1 轮预算标定、3 轮预算感知提示），pass@1 区间 75–100%，
+**提示后 3 轮 95 / 95 / 100%**（60 次运行里 2 次失败，都来自同一条 `click-unset-defaults`）。
+提示前的波动已归因：**是「终点由天花板落在哪一步决定」，不是模型随机**（`BASELINE.md` 结论 23）。
 一轮 20 条现在 3 分钟跑完（并发 4：墙钟 762.6s → 171.8s，pass@1 不变）。
 数字、失败阶段分布与取舍见 `BASELINE.md`，任务清单与造任务流程见 `tasks/README.md`。
 
@@ -42,7 +43,7 @@ M3 把任务集扩到 20 条、覆盖 4 个真实仓库（itsdangerous / click /
 | `repo_agent/task.py` | 克隆 + 基线检出 + 仓库概览（`core.autocrlf=false` 在 clone 时传入，否则补丁不可信） |
 | `repo_agent/cli.py` | `run` / `eval` 两个子命令 |
 | `harness/run_eval.py` | 评估 harness：任务有效性门禁 → 跑 Agent → 契约校验 → 应用到干净检出 → 判定与统计 |
-| `tests/` | 73 个离线测试（脚本模型，无需 API key / 网络 / Docker） |
+| `tests/` | 79 个离线测试（脚本模型，无需 API key / 网络 / Docker） |
 | `tasks/` | 任务集：`golden.jsonl` + Issue 文本 + 夹具补丁；造任务的完整流程与坑见 `tasks/README.md` |
 | `tools/` | `make_fixture.py`（造夹具并审计"未来"是否泄漏）、`split_pr_diff.py`（切 PR 补丁）、`md_to_docx.py`（Markdown → Word） |
 | `BASELINE.md` | 基线记录：任务集、每次运行的 pass@1 / 步数 / token / 费用 / 变更说明 |
@@ -107,7 +108,7 @@ $env:DEEPSEEK_API_KEY = "sk-..."      # 密钥只放环境变量，绝不进仓�
 
 ## 已验证 / 未验证
 
-已验证（本机，`python -m unittest discover -s tests -t .` → 42 项全绿）：
+已验证（本机，`python -m unittest discover -s tests -t .` → 79 项全绿）：
 
 - 脚本化闭环：复现 → 读文件 → 精确替换 → 重跑测试 → 提交，产出合法补丁并能应用到干净检出；
 - 防作弊：写测试文件被工具层拒绝，`ok=False` 记录在 trace，补丁不含测试文件；
@@ -131,14 +132,16 @@ $env:DEEPSEEK_API_KEY = "sk-..."      # 密钥只放环境变量，绝不进仓�
   恰好同长度，于是正确补丁会被旧字节码判成失败、同长度的回归也能被判成通过。
   `run_shell` 现在一律带 `PYTHONDONTWRITEBYTECODE=1`，`tests/test_harness.py` 钉住这条。
 
-真实运行（M3 任务集，20 条 / 4 个仓库）：同一批任务连跑 9 轮，pass@1 = **75 / 90 / 85 / 90 / 90 /
-90 / 90 / 95 / 85%**（近 7 轮区间 85–95%），平均 9.3–12.4 步、74k–115k token、$0.0074–$0.0108、29–50s。
-20 条里 **19 条至少成功过一次**，唯一 7 轮全败的是 `click-unset-defaults`。
-**逐任务波动 4 条**（近 7 轮）——Step 5 的"≤ 1 条"未达标，但归因清楚了：**波动的 4 条任务几乎每一轮
-都由天花板终止**（`click-show-default` 7/7、`packaging-interp-tags` 7/7 撞 token 上限），
-而会自己 `submit` 的 16 条零波动。单次 pass@1 不可信，诚实口径是区间（见 `BASELINE.md` 结论 15–23）。
-两次同配置复跑（`j4b` / `j4c`）分别是 18/20 与 19/20——**同一份代码、同一个模型，两次就差 1 条**，
-这就是批次级波动的下限。
+真实运行（M3 任务集，20 条 / 4 个仓库）：同一批任务连跑 12 轮，pass@1 = **75 / 90 / 85 / 90 / 90 /
+90 / 90 / 95 / 85 / 95 / 95 / 100%**（提示前 7 轮 85–95%，提示后 3 轮 95–100%），
+平均 9.3–13.3 步、74k–124k token、$0.0074–$0.0108、29–60s。
+20 条里全部至少成功过一次；提示前唯一 7 轮全败的 `click-unset-defaults` 在提示后 3 轮里过了 1 次
+（仍是撞线后回收 diff，还没做到自己 `submit`）。
+提示前：**逐任务波动 4 条**，共同点是几乎每一轮都由天花板终止（`click-show-default` 7/7、
+`packaging-interp-tags` 7/7 撞 token 上限、`click-unset-defaults` 6/7），而会自己 `submit` 的 16 条零波动
+——Step 5 的「≤ 1 条」在那几条任务上本来就不可能达成。两次同配置复跑（`j4b` / `j4c`）18/20 与 19/20，
+**同一份代码、同一个模型，两次就差 1 条**，这就是批次级波动的下限。
+提示后：失败模式换了形状——失败从 15/140 次降到 2/60 次，且**「一次源码都没改就撞线」从 11 次变成 0 次**（`BASELINE.md` 结论 25）。
 
 未验证：`DockerSandbox` 本机没有 Docker，只做了静态实现（命令经 stdin 送入、超时后 `docker rm -f`），
 接真实仓库前需要在有 Docker 的机器上先跑通一次。

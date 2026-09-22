@@ -118,6 +118,28 @@ class HarnessTests(unittest.TestCase):
             [(row["id"], row["fixed"], row["stage"]) for row in rows("out-parallel")],
         )
 
+    def test_only_accepts_commas_as_well_as_repeated_flags(self) -> None:
+        # `--only a,b` and `--only a --only b` are both natural ways to name two tasks, and
+        # guessing wrong came back as "unknown task id: a,b" - which reads like a typo in the
+        # task id rather than in the separator. Probing three tasks should not need a batch.
+        tasks = self._write_task_set("only.jsonl", ["toy-001", "toy-002", "toy-003"])
+        with mock.patch.object(harness, "run_agent", scripted_run_agent):
+            comma = harness.run_eval(
+                tasks, out_dir=self.tmp / "out-only-comma", only=["toy-001,toy-002"]
+            )
+            repeated = harness.run_eval(
+                tasks, out_dir=self.tmp / "out-only-repeat", only=["toy-001", "toy-002"]
+            )
+        self.assertEqual((comma, repeated), (0, 0))
+
+        def picked(name: str) -> list[str]:
+            text = (self.tmp / name / "results.jsonl").read_text(encoding="utf-8")
+            return [json.loads(line)["id"] for line in text.splitlines() if line.strip()]
+
+        self.assertEqual(picked("out-only-comma"), ["toy-001", "toy-002"])
+        self.assertEqual(picked("out-only-repeat"), picked("out-only-comma"))
+        self.assertEqual(harness.run_eval(tasks, only=["toy-404"]), 2)
+
     def test_an_infrastructure_error_does_not_discard_the_other_tasks(self) -> None:
         # A clone that dies must not throw away the batch, and it must not be reported as a
         # model failure - that would quietly deflate pass@1.

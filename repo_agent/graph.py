@@ -27,6 +27,7 @@ from .llm import ChatClient
 from .patch import collect_patch, validate_patch
 from .prompts import build_system_prompt
 from .state import AgentState
+from .task import SCRATCH_DIR
 from .tools import TOOL_SCHEMAS, WorkspaceTools
 from .trace import Tracer
 
@@ -37,6 +38,34 @@ REPEAT_WARN = 3
 # Repeating past the warning anyway means the model really is looping; kill it here.
 REPEAT_LIMIT = 5
 NOTES_STEP_CHARS = 1_200
+
+#: Fraction of the nearest ceiling after which the loop stops trusting the model to notice
+#: the budget on its own and says something. The traces say why this is needed: of the 15
+#: failed runs across the 2026-09-21 batches, 11 spent the entire budget on view/bash and
+#: never edited a source file at all - what ran out first was attention, not budget.
+NUDGE_AT = 0.7
+#: One sharper reminder in the last stretch. Two messages, not one per step.
+NUDGE_AGAIN_AT = 0.85
+
+EDIT_TOOLS = frozenset({"create_file", "replace_in_file", "insert_lines"})
+
+NUDGE_NO_EDIT = (
+    "[budget warning] {used:.0%} of the run budget is gone ({detail}) and you have not "
+    "edited a single source file yet. Reading more of the repository will not fix the bug: "
+    "make the smallest change you believe in now, run the reproduction command, and iterate "
+    "from what it says. If two explanations both look plausible, pick one and test it."
+)
+
+NUDGE_EDIT_PENDING = (
+    "[budget warning] {used:.0%} of the run budget is gone ({detail}) and the run ends when "
+    "it is exhausted. Stop exploring: run the reproduction command on the current working "
+    "tree, fix whatever it still reports, and call submit. An unfinished run is a failure."
+)
+
+NUDGE_LAST = (
+    "[budget warning] {used:.0%} of the run budget is gone ({detail}). Make the edit and call "
+    "submit now - the next few steps are the last ones."
+)
 
 LOOP_WARNING = (
     "[loop warning] That was the same tool call {warn} times in a row, so the result will not "
@@ -81,6 +110,32 @@ def budget_stop_reason(state: AgentState, cfg: RunConfig) -> str:
     if elapsed >= cfg.budget.max_wall_seconds:
         return "budget:wall_clock"
     return ""
+
+
+def budget_pressure(state: AgentState, cfg: RunConfig) -> tuple[float, str]:
+    """The nearest of the three ceilings, and how much of it is already spent.
+
+    Which ceiling binds first is a property of the task: the 15-step batches died on steps,
+    the calibrated ones on tokens. So the nudge keys off whichever is closest rather than
+    guessing, and reports it in the message so the trace can be read afterwards.
+    """
+    budget = cfg.budget
+    elapsed = time.time() - state.get("started_at", time.time())
+    checks = [
+        (
+            state.get("steps", 0) / budget.max_steps if budget.max_steps else 0.0,
+            f"{state.get('steps', 0)} of {budget.max_steps} steps",
+        ),
+        (
+            state.get("tokens", 0) / budget.max_tokens if budget.max_tokens else 0.0,
+            f"{state.get('tokens', 0):,} of {budget.max_tokens:,} tokens",
+        ),
+        (
+            elapsed / budget.max_wall_seconds if budget.max_wall_seconds else 0.0,
+            f"{elapsed:.0f}s of {budget.max_wall_seconds:.0f}s wall clock",
+        ),
+    ]
+    return max(checks, key=lambda pair: pair[0])
 
 
 def _signature(name: str, args: dict[str, Any]) -> str:
@@ -161,13 +216,21 @@ def _agent_node(deps: GraphDeps) -> Callable[[AgentState], dict[str, Any]]:
 
 def _tools_node(deps: GraphDeps) -> Callable[[AgentState], dict[str, Any]]:
     def node(state: AgentState) -> dict[str, Any]:
+        cfg = deps.cfg
         last = state["messages"][-1]
         signatures = list(state.get("recent_calls", []))
         submitted = state.get("submitted", False)
+        edited = bool(state.get("edited_source", False))
         observations: list[ToolMessage] = []
         for call in list(getattr(last, "tool_calls", []) or []):
             name = call["name"]
             args = call.get("args") or {}
+            if name in EDIT_TOOLS:
+                target = str(args.get("path", "")).replace("\\", "/")
+                # A scratch script is not a fix: the runs that died with an empty patch had
+                # written repro scripts and still never touched the source.
+                if target and not target.startswith(SCRATCH_DIR + "/"):
+                    edited = True
             signatures.append(_signature(name, args))
             started = time.time()
             outcome = deps.tools.dispatch(name, args)
@@ -204,10 +267,38 @@ def _tools_node(deps: GraphDeps) -> Callable[[AgentState], dict[str, Any]]:
             observations.append(
                 HumanMessage(content=LOOP_WARNING.format(warn=REPEAT_WARN, limit=REPEAT_LIMIT))
             )
+        # The budget warning rides on the tool result that triggers it, like the loop
+        # warning: it has to arrive before the next model call, and it has to stay rare.
+        nudge_level = int(state.get("nudge_level", 0))
+        used, detail = budget_pressure(state, cfg)
+        nudge = ""
+        if not submitted and not stop and not budget_stop_reason(state, cfg):
+            if nudge_level < 1 and used >= NUDGE_AT:
+                template = NUDGE_EDIT_PENDING if edited else NUDGE_NO_EDIT
+                nudge = template.format(used=used, detail=detail)
+                nudge_level = 1
+            elif nudge_level < 2 and used >= NUDGE_AGAIN_AT:
+                nudge = NUDGE_LAST.format(used=used, detail=detail)
+                nudge_level = 2
+        if nudge:
+            deps.tracer.event(
+                "budget_nudge",
+                step=state.get("steps", 0),
+                level=nudge_level,
+                used=round(used, 3),
+                ceiling=detail,
+                edited=edited,
+                # The text is part of the evidence: which of the two messages went out is
+                # the whole question when the run's outcome is read later.
+                message=nudge,
+            )
+            observations.append(HumanMessage(content=nudge))
         update: dict[str, Any] = {
             "messages": observations,
             "recent_calls": signatures,
             "submitted": submitted,
+            "edited_source": edited,
+            "nudge_level": nudge_level,
         }
         if stop:
             update["stop_reason"] = stop
